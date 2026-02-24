@@ -6,13 +6,15 @@ Sits between the Director Engine (brain) and Nami (LLM + TTS).
 
 Responsibilities:
   - Gates all speech requests (cooldowns, dedup, interrupt handling)
+  - Fetches full structured context from the Director before forwarding
   - Forwards approved interjections to Nami
   - Tracks Nami's speaking state (TTS reports here)
 
-The brain fires requests freely. We decide what reaches Nami.
+The brain fires requests freely. We decide what reaches Nami,
+and we enrich what we send with the full director context block.
 
 Port: 8001
-Brain: 8002
+Director (brain): 8006
 Nami:  8000
 """
 
@@ -40,7 +42,7 @@ http_client: Optional[httpx.AsyncClient] = None
 class SpeakRequest(BaseModel):
     """Inbound from the brain."""
     trigger: str           # "skill_issue", "thought", "reactive", "interrupt", "dead_air", etc.
-    content: str           # The interjection content / instruction for Nami
+    content: str           # The interjection trigger / instruction for Nami
     priority: float = 0.5  # 0.0 = highest, 1.0 = lowest
     source: str = "DIRECTOR"
     is_interrupt: bool = False
@@ -61,7 +63,7 @@ class SpeechStatePayload(BaseModel):
 async def handle_speak(req: SpeakRequest):
     """
     The brain pushes ALL speech requests here.
-    We gate them and forward survivors to Nami.
+    We gate them and forward survivors to Nami — with full context attached.
     """
     # --- INTERRUPT PATH (bypasses normal gates) ---
     if req.is_interrupt:
@@ -71,7 +73,7 @@ async def handle_speak(req: SpeakRequest):
         if was_speaking:
             await _signal_nami_interrupt(req.trigger)
 
-        # Forward the interrupt interjection
+        # Forward the interrupt interjection (with context)
         success = await _forward_to_nami(req)
         return {
             "delivered": success,
@@ -80,7 +82,7 @@ async def handle_speak(req: SpeakRequest):
         }
 
     # --- NORMAL PATH (full gate check) ---
-    
+
     # Dedup check
     if gate.check_event_reacted(req.event_id):
         return {"delivered": False, "gate_result": "already_reacted"}
@@ -91,7 +93,7 @@ async def handle_speak(req: SpeakRequest):
         print(f"🚫 [Gate] Blocked: {check['reason']} | {req.trigger}: {req.content[:40]}...")
         return {"delivered": False, "gate_result": check["reason"]}
 
-    # All gates passed — forward to Nami
+    # All gates passed — enrich with context and forward to Nami
     success = await _forward_to_nami(req)
 
     if success:
@@ -162,23 +164,107 @@ async def speech_state():
 
 
 # =====================================================
+# INTERNAL — Context Fetch from Director
+# =====================================================
+
+async def _fetch_director_context(req: SpeakRequest) -> Optional[Dict[str, Any]]:
+    """
+    Call the Director's /context endpoint to get the full structured prompt.
+
+    Passes the trigger and metadata back so the director can tailor the
+    context to the specific speech event (e.g. a skill issue vs dead air
+    may result in different memory retrieval or detail levels).
+
+    Returns the full context dict, or None if the director is unreachable
+    or times out — caller falls back to sending trigger-only content so
+    Nami still fires rather than silently dropping the request.
+    """
+    global http_client
+    if not http_client:
+        return None
+
+    payload = {
+        "trigger": req.trigger,
+        "event_id": req.event_id,
+        "metadata": req.metadata,
+    }
+
+    try:
+        response = await http_client.post(
+            f"{config.DIRECTOR_URL}/context",
+            json=payload,
+            timeout=config.DIRECTOR_CONTEXT_TIMEOUT,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            print(
+                f"📋 [Prompt] Got context from Director "
+                f"({len(data.get('context', ''))} chars, "
+                f"scene={data.get('scene', '?')}, "
+                f"mood={data.get('mood', '?')})"
+            )
+            return data
+        else:
+            print(f"⚠️ [Prompt] Director /context returned {response.status_code}")
+            return None
+    except httpx.ConnectError:
+        print(f"⚠️ [Prompt] Director unreachable at {config.DIRECTOR_URL} — sending without context")
+        return None
+    except httpx.TimeoutException:
+        print(f"⚠️ [Prompt] Director /context timed out ({config.DIRECTOR_CONTEXT_TIMEOUT}s) — sending without context")
+        return None
+    except Exception as e:
+        print(f"⚠️ [Prompt] Context fetch error: {e}")
+        return None
+
+
+# =====================================================
 # INTERNAL — Delivery to Nami
 # =====================================================
 
 async def _forward_to_nami(req: SpeakRequest) -> bool:
-    """Forward an approved interjection to Nami's funnel."""
+    """
+    Fetch full context from the Director, then forward the enriched
+    interjection to Nami's funnel.
+
+    What Nami receives:
+      - context:  The full structured prompt block from the director
+                  (visual summary, event log, memories, directive, etc.)
+      - content:  The specific trigger / instruction from the brain
+                  (e.g. "Skill Issue Detected", "Dead Air", or the user's
+                  actual words for a direct address)
+
+    If the director is down we fall back to sending content alone so
+    Nami still fires rather than silently dropping the request.
+    """
     global http_client
     if not http_client:
         print("❌ [Prompt] No HTTP client!")
         return False
 
+    # --- Fetch context from Director ---
+    director_data = await _fetch_director_context(req)
+    context_block = director_data.get("context", "") if director_data else ""
+
+    if not context_block:
+        print(f"⚠️ [Prompt] No context block — Nami will use base personality for: {req.trigger}")
+
+    # --- Build payload for Nami ---
     payload = {
+        # Full structured context (visual, audio, chat, memories, directive)
+        "context": context_block,
+        # The specific trigger instruction the brain generated
         "content": req.content,
         "priority": 0.0 if req.is_interrupt else req.priority,
         "source_info": {
             "source": req.source,
             "use_tts": True,
             "is_interrupt": req.is_interrupt,
+            # Pass through director state so Nami's prompt builder can use it
+            "mood": director_data.get("mood") if director_data else None,
+            "scene": director_data.get("scene") if director_data else None,
+            "directive": director_data.get("directive") if director_data else None,
+            "active_user": director_data.get("active_user") if director_data else None,
             **req.metadata,
         },
     }
@@ -235,7 +321,8 @@ async def startup():
     global http_client
     http_client = httpx.AsyncClient()
     print(f"🎤 Prompt Service ready on port {config.PROMPT_SERVICE_PORT}")
-    print(f"   → Nami: {config.NAMI_INTERJECT_URL}")
+    print(f"   → Director: {config.DIRECTOR_URL}/context")
+    print(f"   → Nami:     {config.NAMI_INTERJECT_URL}")
 
 
 @app.on_event("shutdown")
